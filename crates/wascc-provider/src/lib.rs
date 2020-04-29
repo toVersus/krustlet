@@ -37,17 +37,20 @@ use kubelet::handle::{key_from_pod, pod_key, PodHandle, RuntimeHandle, Stop};
 use kubelet::module_store::ModuleStore;
 use kubelet::provider::ProviderError;
 use kubelet::status::{update_pod_status, ContainerStatus, Phase, Status};
+use kubelet::volumes::VolumeRef;
 use kubelet::{Pod, Provider};
 use log::{debug, error, info, trace};
 use tempfile::NamedTempFile;
 use tokio::fs::File;
 use tokio::sync::watch::{self, Receiver};
 use tokio::sync::RwLock;
+use wascc_fs::FileSystemProvider;
 use wascc_host::{Actor, NativeCapability, WasccHost};
 use wascc_httpsrv::HttpServerProvider;
 use wascc_logging::{LoggingProvider, LOG_PATH_KEY};
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -62,6 +65,13 @@ const LOG_CAPABILITY: &str = "wascc:logging";
 
 /// The root directory of waSCC logs.
 const LOG_DIR_NAME: &str = "wascc-logs";
+
+// /// The name of the FileSystem capability.
+const FS_CAPABILITY: &str = "wascc:blobstore";
+
+const VOLUME_DIR: &str = "volumes";
+
+const VOLUME_ROOT_DIR: &str = "ROOT";
 
 /// Kubernetes' view of environment variables is an unordered map of string to string.
 type EnvVars = std::collections::HashMap<String, String>;
@@ -106,6 +116,7 @@ pub struct WasccProvider<S> {
     log_path: PathBuf,
     kubeconfig: kube::Config,
     host: Arc<Mutex<WasccHost>>,
+    volume_path: PathBuf,
 }
 
 impl<S: ModuleStore + Send + Sync> WasccProvider<S> {
@@ -118,7 +129,9 @@ impl<S: ModuleStore + Send + Sync> WasccProvider<S> {
     ) -> anyhow::Result<Self> {
         let host = Arc::new(Mutex::new(WasccHost::new()));
         let log_path = config.data_dir.join(LOG_DIR_NAME);
+        let volume_path = config.data_dir.join(VOLUME_DIR);
         tokio::fs::create_dir_all(&log_path).await?;
+        tokio::fs::create_dir_all(&volume_path).await?;
 
         // wascc has native and portable capabilities.
         //
@@ -154,7 +167,17 @@ impl<S: ModuleStore + Send + Sync> WasccProvider<S> {
                 .lock()
                 .unwrap()
                 .add_native_capability(logging_capability)
-                .map_err(|e| anyhow::anyhow!("Failed to add LOG capability: {}", e))
+                .map_err(|e| anyhow::anyhow!("Failed to add LOG capability: {}", e))?;
+
+            info!("Loading FS Capability");
+            let fs_provider = FileSystemProvider::new();
+            let fs_capability = NativeCapability::from_instance(fs_provider, None)
+                .map_err(|e| anyhow::anyhow!("Failed to instantiate FS capability: {}", e))?;
+            cloned_host
+                .lock()
+                .unwrap()
+                .add_native_capability(fs_capability)
+                .map_err(|e| anyhow::anyhow!("Failed to add FS capability: {}", e))
         })
         .await??;
         Ok(Self {
@@ -163,6 +186,7 @@ impl<S: ModuleStore + Send + Sync> WasccProvider<S> {
             log_path,
             kubeconfig,
             host,
+            volume_path,
         })
     }
 }
@@ -182,6 +206,7 @@ impl<S: ModuleStore + Send + Sync> Provider for WasccProvider<S> {
         let mut modules = self.store.fetch_pod_modules(&pod).await?;
         let mut container_handles = HashMap::new();
         let client = kube::Client::new(self.kubeconfig.clone());
+        let volumes = VolumeRef::volumes_from_pod(&self.volume_path, &pod, &client).await?;
         for container in pod.containers() {
             let env = Self::env_vars(&container, &pod, &client).await;
 
@@ -190,6 +215,32 @@ impl<S: ModuleStore + Send + Sync> Provider for WasccProvider<S> {
             let module_data = modules
                 .remove(&container.name)
                 .expect("FATAL ERROR: module map not properly populated");
+            let container_volumes: HashMap<PathBuf, Option<PathBuf>> =
+                if let Some(volume_mounts) = container.volume_mounts.as_ref() {
+                    volume_mounts
+                        .iter()
+                        .map(|vm| -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+                            // Check the volume exists first
+                            let vol = volumes.get(&vm.name).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "no volume with the name of {} found for container {}",
+                                    vm.name,
+                                    container.name
+                                )
+                            })?;
+                            let mut guest_path = PathBuf::from(&vm.mount_path);
+                            if let Some(sub_path) = &vm.sub_path {
+                                guest_path.push(sub_path);
+                            }
+                            // We can safely assume that this should be valid UTF-8 because it would have
+                            // been validated by the k8s API
+                            Ok((vol.deref().clone(), Some(guest_path)))
+                        })
+                        .collect::<anyhow::Result<_>>()?
+                } else {
+                    HashMap::default()
+                };
+
             let lp = self.log_path.clone();
             let (status_sender, status_recv) = watch::channel(ContainerStatus::Waiting {
                 timestamp: chrono::Utc::now(),
@@ -197,7 +248,7 @@ impl<S: ModuleStore + Send + Sync> Provider for WasccProvider<S> {
             });
             let host = self.host.clone();
             let http_result = tokio::task::spawn_blocking(move || {
-                wascc_run_http(host, module_data, env, &lp, status_recv)
+                wascc_run_http(host, module_data, env, &lp, container_volumes, status_recv)
             })
             .await?;
             match http_result {
@@ -381,6 +432,7 @@ fn wascc_run_http(
     data: Vec<u8>,
     env: EnvVars,
     log_path: &Path,
+    dirs: HashMap<PathBuf, Option<PathBuf>>,
     status_recv: Receiver<ContainerStatus>,
 ) -> anyhow::Result<RuntimeHandle<ActorStopper, File>> {
     let mut caps: Vec<Capability> = Vec::new();
@@ -389,7 +441,7 @@ fn wascc_run_http(
         name: HTTP_CAPABILITY,
         env,
     });
-    wascc_run(host, data, &mut caps, log_path, status_recv)
+    wascc_run(host, data, &mut caps, log_path, dirs, status_recv)
 }
 
 /// Capability describes a waSCC capability.
@@ -411,6 +463,7 @@ fn wascc_run(
     data: Vec<u8>,
     capabilities: &mut Vec<Capability>,
     log_path: &Path,
+    dirs: HashMap<PathBuf, Option<PathBuf>>,
     status_recv: Receiver<ContainerStatus>,
 ) -> anyhow::Result<RuntimeHandle<ActorStopper, File>> {
     info!("sending actor to wascc host");
@@ -424,6 +477,20 @@ fn wascc_run(
         name: LOG_CAPABILITY,
         env: logenv,
     });
+
+    for (key, value) in dirs.iter() {
+        let guest_dir = value.as_ref().unwrap_or(key);
+        let volume_output = NamedTempFile::new_in(guest_dir)?;
+        let mut fsenv: HashMap<String, String> = HashMap::new();
+        fsenv.insert(
+            VOLUME_ROOT_DIR.to_string(),
+            volume_output.path().to_str().unwrap().to_owned(),
+        );
+        capabilities.push(Capability {
+            name: FS_CAPABILITY,
+            env: fsenv,
+        });
+    }
 
     let load = Actor::from_bytes(data).map_err(|e| anyhow::anyhow!("Error loading WASM: {}", e))?;
     let pk = load.public_key();
